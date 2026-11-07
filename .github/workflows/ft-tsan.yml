@@ -26,7 +26,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        ref: ["952c8d46d90530ddc497d22bdf4b4ccfce4e903c"]
+        # base: grpc master; fix: python-server-is-shutdown-race
+        ref: ["952c8d46d90530ddc497d22bdf4b4ccfce4e903c", "84dbbe91bc7f696582ff3ef6ab2464b31b39d095"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

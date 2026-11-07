@@ -267,7 +267,33 @@ def scenario_aio(threads, n):
     return {"seconds": round(elapsed, 3), "errors": errors.items[:20], "n_errors": len(errors.items)}
 
 
+def scenario_server_stop_grace(threads, n):
+    """Stop idle servers with a tiny grace period.
+
+    server.stop(grace) starts a timer thread that calls
+    cygrpc.Server.cancel_all_calls() (reads Server.is_shutdown) while the
+    serving thread receives the shutdown notification from the completion
+    queue (writes Server.is_shutdown) without holding the server lock.
+    """
+    errors = _Errors()
+
+    def worker(i):
+        try:
+            for _ in range(n):
+                server, _ = _make_server(workers=2)
+                if not server.stop(grace=0.001).wait(timeout=30):
+                    errors.add("stop timed out")
+        except Exception as e:  # pylint: disable=broad-except
+            errors.add("%s: %s" % (type(e).__name__, str(e)[:200]))
+
+    start = time.perf_counter()
+    _run_threads(worker, threads)
+    elapsed = time.perf_counter() - start
+    return {"seconds": round(elapsed, 3), "errors": errors.items[:20], "n_errors": len(errors.items)}
+
+
 SCENARIOS = {
+    "server_stop_grace": scenario_server_stop_grace,
     "sync": scenario_sync,
     "churn": scenario_churn,
     "close_race": scenario_close_race,

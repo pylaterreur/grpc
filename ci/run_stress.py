@@ -10,6 +10,7 @@ import time
 
 # scenario, threads, n, repetitions
 PLAN = (
+    ("server_stop_grace", 4, 50, 5),
     ("sync", 16, 300, 3),
     ("churn", 9, 30, 3),
     ("close_race", 8, 30, 3),

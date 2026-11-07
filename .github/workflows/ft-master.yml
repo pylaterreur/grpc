@@ -23,8 +23,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.14t", "3.15t"]
-        ref: ["952c8d46d90530ddc497d22bdf4b4ccfce4e903c"]
+        # python-server-is-shutdown-race (fix) on free-threaded and regular builds
+        python: ["3.14t", "3.15t", "3.14"]
+        ref: ["84dbbe91bc7f696582ff3ef6ab2464b31b39d095"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -90,12 +91,14 @@ jobs:
             | grep -v -E '_dynamic_stubs_test$' > "$GITHUB_WORKSPACE/out/test_modules.txt"
           wc -l "$GITHUB_WORKSPACE/out/test_modules.txt"
       - name: Unit tests, GIL forced off (-X gil=0, PYTHON_GIL=0)
+        if: endsWith(matrix.python, 't')
         continue-on-error: true
         run: python probe/ci/run_unit.py --tests-dir grpc-src/src/python/grpcio_tests --mode gil0 --out out/unit-gil0 --modules-file out/test_modules.txt
       - name: Unit tests, default mode
         continue-on-error: true
         run: python probe/ci/run_unit.py --tests-dir grpc-src/src/python/grpcio_tests --mode default --out out/unit-default --modules-file out/test_modules.txt
       - name: Stress, GIL forced off
+        if: endsWith(matrix.python, 't')
         continue-on-error: true
         run: python probe/ci/run_stress.py --mode gil0 --out out/stress-gil0
       - name: Stress, default mode

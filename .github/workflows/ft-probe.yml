@@ -1,0 +1,201 @@
+# Probe: build grpcio 1.85.1 from its PyPI sdist on free-threaded CPython and
+# check import/GIL behaviour, unit tests and multi-threaded stress scenarios.
+# Throwaway investigation branch on a personal fork; not meant for upstream.
+name: grpcio free-threading probe
+
+on:
+  push:
+    branches: [ft-probe]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GRPC_VERSION: "1.85.1"
+  GRPCIO_SDIST_URL: https://files.pythonhosted.org/packages/f0/03/f9e805772d4d01da2a1754a5f63c58601eacaf8f1e878729217188de7d16/grpcio-1.85.1.tar.gz
+  GRPCIO_SDIST_SHA256: 5f530287d5de5f7f66089ead81de44f6787162944dab3922efa65dfdff108a1d
+  GRPCIO_TOOLS_SDIST_URL: https://files.pythonhosted.org/packages/7f/82/30d41f6ea0d62560be10ddb5d37557a8e99a936ab44db70d22219b2aab4e/grpcio_tools-1.85.1.tar.gz
+  GRPCIO_TOOLS_SDIST_SHA256: d6f1ee213a07de9462c90ee5debe4a78dff20306a0fb394a65d48b2f94fe31a1
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  grpcio:
+    name: grpcio ${{ matrix.python }} ${{ matrix.variant }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {python: "3.13t", variant: stock}
+          - {python: "3.14t", variant: stock}
+          - {python: "3.15t", variant: stock}
+          # Same sources, compiled with -DCYTHON_FREETHREADING_COMPATIBLE=1:
+          # the Cython 3.2.8 output then declares Py_MOD_GIL_NOT_USED.
+          - {python: "3.15t", variant: ftcompat}
+          # GIL control: the official PyPI wheel on a regular build.
+          - {python: "3.14", variant: pypi-wheel}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: probe
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: grpc/grpc
+          ref: v1.85.1
+          path: grpc-src
+          sparse-checkout: |
+            src/python/grpcio_tests
+            src/proto
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Interpreter info
+        run: |
+          python -VV
+          python -c "import sys, sysconfig; print('Py_GIL_DISABLED', sysconfig.get_config_var('Py_GIL_DISABLED')); print('GIL enabled at startup', getattr(sys, '_is_gil_enabled', lambda: True)())"
+          nproc
+          free -g
+      - name: Build grpcio wheel from the sdist
+        if: matrix.variant != 'pypi-wheel'
+        env:
+          GRPC_PYTHON_BUILD_EXT_COMPILER_JOBS: "4"
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          mkdir -p out
+          curl -sSfL -o grpcio.tar.gz "$GRPCIO_SDIST_URL"
+          echo "$GRPCIO_SDIST_SHA256  grpcio.tar.gz" | sha256sum -c -
+          if [ "$VARIANT" = ftcompat ]; then
+            export CPPFLAGS="-DCYTHON_FREETHREADING_COMPATIBLE=1"
+            export CFLAGS="$CPPFLAGS" CXXFLAGS="$CPPFLAGS"
+          fi
+          python -m pip install -U pip
+          start=$(date +%s)
+          if ! python -m pip wheel --no-deps -w wheelhouse -v ./grpcio.tar.gz > out/build-grpcio.log 2>&1; then
+            tail -n 300 out/build-grpcio.log
+            exit 1
+          fi
+          echo "grpcio build seconds: $(( $(date +%s) - start ))" | tee out/build-time.txt
+          grep -c -E 'CYTHON_FREETHREADING_COMPATIBLE' out/build-grpcio.log || true
+          grep -i -E 'warning: .*(deprecated|free.?thread|Py_GIL)' out/build-grpcio.log | sort | uniq -c | sort -rn | head -n 20 || true
+          ls -la wheelhouse
+      - name: Install grpcio and test dependencies
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          mkdir -p out
+          if [ "$VARIANT" = pypi-wheel ]; then
+            python -m pip install --only-binary=:all: "grpcio==$GRPC_VERSION"
+          else
+            python -m pip install wheelhouse/grpcio-*.whl
+          fi
+          python -m pip install "protobuf>=7.35.1,<8" coverage typeguard typing_extensions absl-py oauth2client google-auth requests
+          python -m pip list | tee out/pip-list.txt
+      - name: Import check
+        run: |
+          {
+            echo "### default"; python probe/ci/import_check.py
+            echo "### -X gil=0"; python -X gil=0 probe/ci/import_check.py
+            echo "### PYTHON_GIL=0"; PYTHON_GIL=0 python probe/ci/import_check.py
+          } 2>&1 | tee out/import-check.txt
+      - name: Generate test protos (system Python + grpcio-tools wheel)
+        run: |
+          /usr/bin/python3 -m venv "$RUNNER_TEMP/protoc-venv"
+          "$RUNNER_TEMP/protoc-venv/bin/pip" install -q "grpcio-tools==$GRPC_VERSION"
+          cd grpc-src
+          "$RUNNER_TEMP/protoc-venv/bin/python" -m grpc_tools.protoc -I. \
+            --python_out=src/python/grpcio_tests --grpc_python_out=src/python/grpcio_tests \
+            src/proto/grpc/testing/empty.proto src/proto/grpc/testing/messages.proto src/proto/grpc/testing/test.proto
+          find src/python/grpcio_tests/src -name '*.py'
+      - name: Unit tests, GIL forced off (-X gil=0, PYTHON_GIL=0)
+        if: matrix.variant != 'pypi-wheel'
+        continue-on-error: true
+        run: python probe/ci/run_unit.py --tests-dir grpc-src/src/python/grpcio_tests --mode gil0 --out out/unit-gil0 --modules-file probe/ci/test_modules.txt
+      - name: Unit tests, default mode
+        continue-on-error: true
+        run: python probe/ci/run_unit.py --tests-dir grpc-src/src/python/grpcio_tests --mode default --out out/unit-default --modules-file probe/ci/test_modules.txt
+      - name: Stress, GIL forced off
+        if: matrix.variant != 'pypi-wheel'
+        continue-on-error: true
+        run: python probe/ci/run_stress.py --mode gil0 --out out/stress-gil0
+      - name: Stress, default mode
+        continue-on-error: true
+        run: python probe/ci/run_stress.py --mode default --out out/stress-default
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## grpcio ${{ matrix.python }} ${{ matrix.variant }}"
+            echo '```'
+            cat out/build-time.txt 2>/dev/null || true
+            grep -E '^(###|GIL enabled|WARNING)' out/import-check.txt 2>/dev/null || true
+            cat out/unit-gil0/summary.txt 2>/dev/null || true
+            cat out/unit-default/summary.txt 2>/dev/null || true
+            python -c "import json,sys; [print(m, json.dumps(s, sort_keys=True)) for m in ('gil0','default') for s in (json.load(open('out/stress-%s/summary.json' % m))['summary'] if __import__('os').path.exists('out/stress-%s/summary.json' % m) else [])]" || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: grpcio-${{ matrix.python }}-${{ matrix.variant }}
+          path: |
+            out/
+            wheelhouse/
+          retention-days: 7
+          if-no-files-found: warn
+
+  grpcio-tools:
+    name: grpcio-tools ${{ matrix.python }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.14t", "3.15t"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: probe
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Build grpcio-tools wheel from the sdist
+        env:
+          GRPC_PYTHON_BUILD_EXT_COMPILER_JOBS: "4"
+        run: |
+          mkdir -p out
+          python -VV
+          curl -sSfL -o grpcio_tools.tar.gz "$GRPCIO_TOOLS_SDIST_URL"
+          echo "$GRPCIO_TOOLS_SDIST_SHA256  grpcio_tools.tar.gz" | sha256sum -c -
+          python -m pip install -U pip
+          start=$(date +%s)
+          if ! python -m pip wheel --no-deps -w wheelhouse -v ./grpcio_tools.tar.gz > out/build-grpcio-tools.log 2>&1; then
+            tail -n 300 out/build-grpcio-tools.log
+            exit 1
+          fi
+          echo "grpcio-tools build seconds: $(( $(date +%s) - start ))" | tee out/build-time.txt
+          ls -la wheelhouse
+      - name: Import and protoc check
+        run: |
+          python -m pip install --no-deps wheelhouse/grpcio_tools-*.whl
+          python -m pip install "protobuf>=7.35.1,<8" setuptools
+          {
+            echo "### default"; python probe/ci/import_check.py --module grpc_tools._protoc_compiler
+            echo "### -X gil=0"; python -X gil=0 probe/ci/import_check.py --module grpc_tools._protoc_compiler
+          } 2>&1 | tee out/import-check.txt
+          mkdir -p gen
+          printf 'syntax = "proto3";\npackage probe;\nmessage Ping { string s = 1; }\nservice Echo { rpc Unary (Ping) returns (Ping); }\n' > gen/probe.proto
+          python -X gil=0 -m grpc_tools.protoc -Igen --python_out=gen --grpc_python_out=gen --pyi_out=gen gen/probe.proto
+          ls -la gen | tee -a out/import-check.txt
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: grpcio-tools-${{ matrix.python }}
+          path: out/
+          retention-days: 7
+          if-no-files-found: warn

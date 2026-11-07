@@ -1,0 +1,151 @@
+# Probe: ThreadSanitizer run of grpcio (from a git ref) on a TSan-instrumented
+# free-threaded CPython 3.14, with the GIL kept off (PYTHON_GIL=0).
+# Throwaway investigation workflow on a personal fork.
+name: grpcio TSan free-threading probe
+
+on:
+  push:
+    branches: [ft-tsan-probe]
+
+permissions:
+  contents: read
+
+env:
+  GRPC_REPO: pylaterreur/grpc
+  CPYTHON_TAG: v3.14.10
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONUNBUFFERED: "1"
+  CC: clang
+  CXX: clang++
+
+jobs:
+  tsan:
+    name: tsan ${{ matrix.ref }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        ref: ["952c8d46d90530ddc497d22bdf4b4ccfce4e903c"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: probe
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.GRPC_REPO }}
+          ref: ${{ matrix.ref }}
+          path: grpc-src
+          persist-credentials: false
+      - name: Fetch the submodules the Python build needs
+        working-directory: grpc-src
+        run: |
+          git log -1 --format='%H %cd %s'
+          git submodule update --init --depth 1 --jobs 6 \
+            third_party/abseil-cpp third_party/boringssl-with-bazel \
+            third_party/cares/cares third_party/re2 third_party/zlib \
+            third_party/cel-c
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q build-essential libssl-dev zlib1g-dev libffi-dev \
+            libbz2-dev libreadline-dev libsqlite3-dev liblzma-dev uuid-dev
+          clang --version
+          sudo sysctl -w vm.mmap_rnd_bits=28  # TSan needs reduced ASLR entropy
+      - name: Build TSan free-threaded CPython
+        run: |
+          mkdir -p out
+          git clone -q --depth 1 --branch "$CPYTHON_TAG" https://github.com/python/cpython.git cpython
+          cd cpython
+          ./configure -q --prefix="$RUNNER_TEMP/py" --disable-gil --with-thread-sanitizer OPT="-O2 -g" > ../out/cpython-configure.log 2>&1
+          make -s -j4 > ../out/cpython-build.log 2>&1 || { tail -n 100 ../out/cpython-build.log; exit 1; }
+          make -s install > ../out/cpython-install.log 2>&1 || { tail -n 100 ../out/cpython-install.log; exit 1; }
+          echo "TSAN_SUPPRESSIONS=$PWD/Tools/tsan/suppressions_free_threading.txt" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/py/bin/python3" -VV
+          "$RUNNER_TEMP/py/bin/python3" -c "import sysconfig; print(sysconfig.get_config_var('CFLAGS')); print(sysconfig.get_config_var('LDSHARED'))"
+      - name: Build grpcio with -fsanitize=thread
+        env:
+          GRPC_PYTHON_BUILD_EXT_COMPILER_JOBS: "4"
+          GRPC_PYTHON_BUILD_WITH_CYTHON: "1"
+          CFLAGS: "-fsanitize=thread -g"
+          CXXFLAGS: "-fsanitize=thread -g"
+          LDFLAGS: "-fsanitize=thread"
+          TSAN_OPTIONS: "report_bugs=0"
+        run: |
+          PY="$RUNNER_TEMP/py/bin/python3"
+          "$PY" -m pip install -q "setuptools==77.0.1" "wheel==0.43.0" "cython==3.2.8"
+          start=$(date +%s)
+          if ! "$PY" -m pip wheel --no-build-isolation --no-deps -w wheelhouse -v ./grpc-src > out/build-grpcio.log 2>&1; then
+            tail -n 300 out/build-grpcio.log
+            exit 1
+          fi
+          echo "grpcio build seconds: $(( $(date +%s) - start ))" | tee out/build-time.txt
+          cp grpc-src/src/python/grpcio/grpc/_cython/cygrpc.cpp out/ || true
+          ls -la wheelhouse
+      - name: Install grpcio and test dependencies
+        env:
+          TSAN_OPTIONS: "report_bugs=0"
+        run: |
+          PY="$RUNNER_TEMP/py/bin/python3"
+          "$PY" -m pip install -q wheelhouse/grpcio-*.whl
+          "$PY" -m pip install -q "protobuf>=7.35.1,<8" coverage typeguard typing_extensions absl-py oauth2client google-auth requests
+          "$PY" -m pip list > out/pip-list.txt
+      - name: Generate test protos (system Python + grpcio-tools wheel)
+        run: |
+          /usr/bin/python3 -m venv "$RUNNER_TEMP/protoc-venv"
+          "$RUNNER_TEMP/protoc-venv/bin/pip" install -q grpcio-tools
+          cd grpc-src
+          "$RUNNER_TEMP/protoc-venv/bin/python" -m grpc_tools.protoc -I. \
+            --python_out=src/python/grpcio_tests --grpc_python_out=src/python/grpcio_tests \
+            src/proto/grpc/testing/empty.proto src/proto/grpc/testing/messages.proto src/proto/grpc/testing/test.proto
+          cd src/python/grpcio_tests
+          find tests/unit tests_aio/unit -name '*_test.py' | sort | sed 's|\.py$||; s|/|.|g' \
+            | grep -v -E '_dynamic_stubs_test$' > "$GITHUB_WORKSPACE/out/test_modules.txt"
+          wc -l "$GITHUB_WORKSPACE/out/test_modules.txt"
+      - name: Import check under TSan
+        run: |
+          mkdir -p out/tsan-import
+          TSAN_OPTIONS="log_path=$GITHUB_WORKSPACE/out/tsan-import/tsan suppressions=$TSAN_SUPPRESSIONS handle_segv=0 halt_on_error=0 exitcode=0" \
+            PYTHON_GIL=0 "$RUNNER_TEMP/py/bin/python3" probe/ci/import_check.py | tee out/import-check.txt
+      - name: Unit tests under TSan, GIL off
+        continue-on-error: true
+        run: |
+          mkdir -p out/tsan-unit
+          export TSAN_OPTIONS="log_path=$GITHUB_WORKSPACE/out/tsan-unit/tsan suppressions=$TSAN_SUPPRESSIONS handle_segv=0 halt_on_error=0 exitcode=0 history_size=4"
+          "$RUNNER_TEMP/py/bin/python3" probe/ci/run_unit.py --tests-dir grpc-src/src/python/grpcio_tests --mode gil0 --timeout 1800 --out out/unit-gil0 --modules-file out/test_modules.txt
+      - name: Stress under TSan, GIL off
+        continue-on-error: true
+        run: |
+          mkdir -p out/tsan-stress
+          export TSAN_OPTIONS="log_path=$GITHUB_WORKSPACE/out/tsan-stress/tsan suppressions=$TSAN_SUPPRESSIONS handle_segv=0 halt_on_error=0 exitcode=0 history_size=4"
+          "$RUNNER_TEMP/py/bin/python3" probe/ci/run_stress.py --mode gil0 --timeout 900 --out out/stress-gil0
+      - name: Summarize TSan reports
+        if: always()
+        run: |
+          for d in tsan-import tsan-unit tsan-stress; do
+            [ -d "out/$d" ] || continue
+            python3 probe/ci/tsan_summary.py "out/$d" --out "out/$d-summary.txt" > /dev/null || true
+            if [ -f out/cygrpc.cpp ]; then
+              python3 probe/ci/cpp_to_pxi.py out/cygrpc.cpp "out/$d-summary.txt" > "out/$d-summary-pxi.txt" || true
+            fi
+          done
+          {
+            echo "## TSan ${{ matrix.ref }}"
+            echo '```'
+            cat out/build-time.txt 2>/dev/null || true
+            grep -E '^GIL enabled' out/import-check.txt 2>/dev/null || true
+            cat out/unit-gil0/summary.txt 2>/dev/null || true
+            for d in tsan-import tsan-unit tsan-stress; do
+              f="out/$d-summary-pxi.txt"; [ -f "$f" ] || f="out/$d-summary.txt"
+              [ -f "$f" ] && { echo "### $d"; head -c 20000 "$f"; }
+            done
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: tsan-${{ matrix.ref }}
+          path: out/
+          retention-days: 7
+          if-no-files-found: warn

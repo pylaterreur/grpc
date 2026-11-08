@@ -1,0 +1,77 @@
+# Probe: rerun one grpcio test module many times on wheels built by earlier
+# ft-master.yml runs (base = grpc master, fix = is_shutdown branch), with the
+# GIL off, to tell a flaky hang from a regression. Throwaway workflow.
+name: grpcio rerun probe
+
+on:
+  push:
+    branches: [ft-rerun-probe]
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  GRPC_REPO: pylaterreur/grpc
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONUNBUFFERED: "1"
+  TEST_MODULE: tests.unit._signal_handling_test
+  ITERATIONS: "60"
+
+jobs:
+  rerun:
+    name: rerun ${{ matrix.variant }} ${{ matrix.python }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {variant: base, python: "3.14t", ref: 952c8d46d90530ddc497d22bdf4b4ccfce4e903c, run_id: "42421431027"}
+          - {variant: fix, python: "3.14t", ref: 84dbbe91bc7f696582ff3ef6ab2464b31b39d095, run_id: "42424620228"}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.GRPC_REPO }}
+          ref: ${{ matrix.ref }}
+          path: grpc-src
+          sparse-checkout: |
+            src/python/grpcio_tests
+            src/proto
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: grpcio-git-${{ matrix.python }}-${{ matrix.ref }}
+          run-id: ${{ matrix.run_id }}
+          github-token: ${{ github.token }}
+          path: artifact
+      - name: Install the wheel and test dependencies
+        run: |
+          python -VV
+          python -m pip install artifact/wheelhouse/grpcio-*.whl
+          python -m pip install "protobuf>=7.35.1,<8" coverage typeguard typing_extensions absl-py
+      - name: Rerun the module with the GIL off
+        working-directory: grpc-src/src/python/grpcio_tests
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          pass=0; fail=0; hang=0
+          for i in $(seq 1 "$ITERATIONS"); do
+            log="$GITHUB_WORKSPACE/out/run-$i.log"
+            # SIGABRT on hang: faulthandler dumps every thread of the test process.
+            rc=0
+            timeout -s ABRT -k 15 120 env PYTHON_GIL=0 python -X faulthandler -X gil=0 -m unittest -v "$TEST_MODULE" > "$log" 2>&1 || rc=$?
+            if [ $rc -eq 0 ]; then pass=$((pass+1)); elif [ $rc -eq 124 ] || [ $rc -eq 134 ] || [ $rc -eq 137 ]; then hang=$((hang+1)); echo "iteration $i: hang/abort rc=$rc"; else fail=$((fail+1)); echo "iteration $i: fail rc=$rc"; fi
+            pkill -f '[_]signal_client' || true
+          done
+          echo "RESULT variant=${{ matrix.variant }} pass=$pass fail=$fail hang=$hang of $ITERATIONS" | tee "$GITHUB_WORKSPACE/out/result.txt"
+          first=$(grep -l -E 'Fatal Python error|Traceback|FAIL|ERROR' "$GITHUB_WORKSPACE"/out/run-*.log | head -n 1 || true)
+          if [ -n "$first" ]; then echo "=== first non-passing log: $first"; head -n 200 "$first"; fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: rerun-${{ matrix.variant }}-${{ matrix.python }}
+          path: out/
+          retention-days: 7

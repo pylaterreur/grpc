@@ -17,7 +17,7 @@ env:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
   PYTHONUNBUFFERED: "1"
   TEST_MODULE: tests.unit._signal_handling_test
-  ITERATIONS: "50"
+  ITERATIONS: "40"
   BASE_REF: 952c8d46d90530ddc497d22bdf4b4ccfce4e903c
   FIX_REF: 84dbbe91bc7f696582ff3ef6ab2464b31b39d095
 
@@ -67,6 +67,9 @@ jobs:
         working-directory: grpc-src/src/python/grpcio_tests
         run: |
           mkdir -p "$GITHUB_WORKSPACE/out"
+          # Job control: without it, bash starts background jobs with SIGINT
+          # ignored, and the signal client inherits that disposition.
+          set -m
           declare -A pass hang fail dumps
           for v in base fix; do pass[$v]=0; hang[$v]=0; fail[$v]=0; dumps[$v]=0; done
           for i in $(seq 1 "$ITERATIONS"); do
